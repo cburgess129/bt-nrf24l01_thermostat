@@ -1,0 +1,1603 @@
+/*Thermostat sketch for an nRF24L01+ radio-controlled thermostat array.
+ * 
+ * Hardware:  Arduino Nano 3.0 (atMega328) or equiv, Nokia 5110 LCD, nRF24L01+ transceiver, DHT11 or DHT22 temp sensor,
+ * 3 Relays capable of switching 24VAC@2A with 5VDC control, DS1307 RTC module, 3.3VDC voltage regulator, 5 momentary  
+ * switches, 1 slide switch.  The circuit can be power by the HVAC 24VAC transformer via a 24VAC-to-5VDC power converter
+ * or equivilent circuitry or can be powered externally with 5V power supply delivering 2A.
+ *
+ * This sketch uses configuration information stored in EEPROM along with temperature
+ * data read from a DHT11 or DHT22 sensor to control 3 relays for heat, cool, and blower fan.
+ * Every 5 minutes it sends status and config data to a central monitoring station
+ * When it is not transmitting, it listens for a transmission from the central monitoring
+ * station to change the active system state and update the configuration in EEPROM.
+ * The thermostat hardware and sketch are designed to control a central HVAC system with single-stage 
+ * heating and cooling.  Any other application is outside the scop of this design.
+ * 
+ * The thermostat listens for broadcasts to its reading pipe, based on its node address.  
+ */
+
+//#define INIT_CONFIG  /* uncomment to initialize EEPROM storage */
+#define BLUETOOTH  /* uncomment to include bluetooth module */
+char *codeVersion = "B2.6";
+//Binary send to HUB
+
+#include <SPI.h>
+#include <Wire.h>
+#include <RF24.h>
+#include <DHT.h>
+#include <EEPROM.h> // EEPROM library
+#include <EEPROMAnything.h>  //  EEPROMAnything Library
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <RTClib.h>  //  Real-time clock library
+
+//#define DEBUG
+
+#if defined(DEBUG)
+#include <printf.h>
+#endif
+
+//  Define the icons displayed during the various HVAC modes
+static const unsigned char c_up[] PROGMEM = // Define UP arrow bitmap
+{ 
+  B00000001, B10000000,
+  B00000011, B11000000,
+  B00000111, B11100000,
+  B00001111, B11110000,
+  B00011111, B11111000,
+  B00111111, B11111100,
+  B01111111, B11111110,
+  B11111111, B11111111,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+};
+
+static const unsigned char c_down[] PROGMEM = // Define DOWN arrow bitmap
+{ 
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B00000011, B11000000,
+  B11111111, B11111111,
+  B01111111, B11111110,
+  B00111111, B11111100,
+  B00011111, B11111000,
+  B00001111, B11110000,
+  B00000111, B11100000,
+  B00000011, B11000000,
+  B00000001, B10000000,
+};
+
+static const unsigned char c_select[] PROGMEM = // Define SELECT arrow bitmap
+{ 
+  B00000000, B10000000,
+  B00000000, B11000000,
+  B00000000, B11100000,
+  B00000000, B11110000,
+  B00000000, B11111000,
+  B00000000, B11111100,
+  B00111111, B11111110,
+  B00111111, B11111111,
+  B00111111, B11111111,
+  B00111111, B11111110,
+  B00000000, B11111100,
+  B00000000, B11111000,
+  B00000000, B11110000,
+  B00000000, B11100000,
+  B00000000, B11000000,
+  B00000000, B10000000,
+};
+
+static const unsigned char fire[] PROGMEM = // Define flame bitmap
+{ 
+  B00000001, B00000000,  
+  B00000001, B00000000,
+  B00000011, B00000000,
+  B00000110, B10000000,
+  B00001100, B10000000,
+  B00011000, B11000000,
+  B00010000, B00100000,
+  B00100011, B00010000,
+  B01000101, B10010000,
+  B01000100, B10010000,
+  B01001100, B11001000,
+  B01011011, B00101000,
+  B01010011, B10101000,
+  B01011011, B10101000,
+  B01101011, B01001000,
+  B00100101, B11010000,
+  B00110110, B11110000,
+  B00011011, B11000000,
+};
+
+static const unsigned char snow[] PROGMEM = // Define snowflake bitmap
+{ 
+  B00000000, B00000000,
+  B00000000, B00000000,
+  B00000000, B00000000,
+  B00000001, B00000000,
+  B00000001, B00000000,
+  B00100001, B00001000,
+  B00010101, B01010000,
+  B00001001, B00100000,
+  B00100101, B01001000,
+  B00000011, B10000000,
+  B11111111, B11111110,
+  B00000011, B10000000,
+  B00100101, B01001000,
+  B00001001, B00100000,
+  B00010101, B01010000,
+  B00100001, B00001000,
+  B00000001, B00000000,
+  B00000001, B00000000,
+};
+
+static const unsigned char fan[] PROGMEM = // Define fan bitmap
+{ 
+  B00000001, B10000000,  
+  B00000010, B01000000,
+  B00000101, B10100000,
+  B00000101, B00100000,  
+  B00000010, B01000000,
+  B00110001, B10001100,  
+  B01001011, B11010010,
+  B10100110, B01101101,  
+  B10110110, B01100101,
+  B01001011, B11010010,  
+  B00110001, B10001100,
+  B00000010, B01000000,
+  B00000101, B00100000,  
+  B00000101, B10100000,
+  B00000010, B01000000,  
+  B00000001, B10000000,
+};
+
+static const unsigned char small_select[] PROGMEM = // Define SELECT arrow bitmap
+{ 
+  B00000000, B10000000,
+  B00000000, B11000000,
+  B00000000, B11100000,
+  B11111111, B11110000,
+  B11111111, B11111000,
+  B11111111, B11110000,
+  B00000000, B11100000,
+  B00000000, B11000000,
+  B00000000, B10000000,
+};
+
+//  Initialize the real-time clock on the I2C bus
+RTC_DS1307 RTC;
+
+//  Initialize the LCD display on the SPI bus plus pins 3, 4, 5
+Adafruit_PCD8544 display = Adafruit_PCD8544(5, 4, 3);
+
+//  Initialize nRF24L01+ radio on the SPI bus plus pins 9(CE) & 10(CSN)
+RF24 radio(9,10);
+
+//  Define DHTSENSOR configuration
+#define DHTTYPE DHT22
+#define DHT11PINDATA 14
+
+//  Initialize DHT sensor
+DHT dht(DHT11PINDATA, DHTTYPE);
+
+//  Define addresses for 3 possible thermostat nodes
+uint8_t addresses[][6] = { "0Node","1Node","2Node" };
+byte nodeNum = 1;  //Set this node's address
+char displayNode[6];
+
+//  Initialize active configuration variables
+uint8_t heat_set_point;
+uint8_t cool_set_point;
+uint8_t fan_run_length;
+uint8_t fan_start_hour;
+uint8_t fan_stop_hour;
+
+//  Initialize various countdown timer variables
+unsigned long xmitMils = 0; //controls delay between transmission times to central hub - default is 5m
+unsigned long tempCheckMils = 0; //controls delay for checking current temp against set points to turn hvac relays on and off - default is 1m
+unsigned long conpressorCheckMils = 0; //5 minute delay between turning HVAC compressor off and on - prevents short-cycling MUST BE NO SHORTER THAN 5 MINUTES TO PREVENT POSSIBLE COMPRESSOR DAMAGE
+unsigned long displayUpdateMils = 0; //delay between updating the display - default is 30s
+unsigned long fanCheckMils = 0;  //controls delay for turning circulation fan on or off - default is 1m
+unsigned long schedCheckMils = 0; //controls how often current time is checked against schedule start and end times - default is 1m
+unsigned long daysUpCheckMils = 86400000;//time for counting days since reset
+unsigned long backLightMils = 0;//timer for backlight operation
+
+// Initialize other variable
+bool heatCoolStatus = 0; //determines if system is in heat or cool mode 0 = heat, 1 = cool
+bool override = 0; //run heat/cool mode even when threshold is breached 0 = no, 1 = yes.  This param can only be set from the central hub - it can't be configured locally through the menu
+char *sendStatus = "initializing"; //string to hold the status of transmissions to the central hub - used to make the display
+char *lockOutStat = "";  //holds the status of the current state of the lock-out varible - used to make the display
+char *heatCoolStat = ""; //holds the status of the current hear/cool setting - used to make the display
+char *month_result = "";  //holds the 3-character month value - used to make the display
+uint8_t currentHour = 0; //used by CountCycles function - holds the value of the current hour
+uint8_t previousCycleCount = 0; //used by CountCycles function - holds the number of cycles that occured in the previous hour (this is displayed in the MENU function)
+uint8_t cycleCount = 0; //used by the CountCycles function - holds the current cycle count
+uint16_t daysUpCount =0;  //use to hold the number of days since reset
+
+//  Initialize date variables
+char *am_pm;
+uint8_t hours;
+uint8_t minutes;
+uint8_t days;
+char sendTimeStamp[15];
+char recTimeStamp[15];
+char dateString[15];
+char errorString[12] = {"Radio Error"};
+
+//  Initialize schedule variables
+uint8_t morningHour;
+uint8_t morningMinute;
+uint8_t morningHeatSetPoint;
+uint8_t morningCoolSetPoint;
+uint8_t eveningHour;
+uint8_t eveningMinute;
+uint8_t eveningHeatSetPoint;
+uint8_t eveningCoolSetPoint;
+bool whichSched = 0;
+bool lastSched = 1;
+
+//  Initialize Configuration Limits and offsets
+uint8_t coolSetPointUpperLimit = 85;
+uint8_t coolSetPointLowerLimit = 65;
+uint8_t heatSetPointUpperLimit = 80;
+uint8_t heatSetPointLowerLimit = 55;
+uint8_t fanRunLengthUpperLimit = 60;
+uint8_t fanRunLengthLowerLimit = 0;
+uint8_t setHoursUpperLimit = 23;
+uint8_t setHoursLowerLimit = 0;
+uint8_t setMinutesUpperLimit = 45;
+uint8_t setMinutesLowerLimit = 0;
+uint8_t setMinutesIncrement = 15;
+uint8_t setOtherIncrement = 1;
+float setSwingTempUpperLimit = 2.25;
+float setSwingTempLowerLimit = .25;
+float setSwingTempIncrements = .25;
+float setTempOffSetUpperLimit = 3;
+float setTempOffSetLowerLimit = -3;
+float setTempOffSetIncrements = .5;
+float tempOffSet = -3; //adjust temperature reading from of the sensor if nessesary
+float swingTemp = .25; /* set swing temp for use in heat/cool cycle - this value affects how often the HVAC runs   */
+                       /* use values from .25 to 2.25 - larger values = HVAC runs less often but for a longer time */
+                       /* smaller values will cause the HVAC system to cycle more frequently                       */
+
+//  Initialize heatCoolButton debounce variables
+bool HCbuttonState;
+bool lastHCbuttonState = HIGH;
+long lastHCdebounceTime = 0;  // the last time the output pin was toggled
+long debounceDelay = 50;  
+bool onOffState = 0;
+bool previousOnOffState = 0;
+
+//  Initialize menu variables
+bool tempTemp = 0;
+bool commitConfig = 0;
+unsigned long menuTimeoutMils;
+unsigned long menuDebouceMils;
+uint8_t configVariable;
+float floatConfigVariable;
+uint16_t menuPinValue;
+uint16_t previousMenuPinValue;
+char *printWhichVar = "";
+uint8_t whichConfigVar = 0;
+
+//  Define EEPROM data storage stucture
+struct config_store 
+{
+  uint8_t morningH;
+  uint8_t morningM;
+  uint8_t morningHP;
+  uint8_t morningCP;
+  uint8_t eveningH;
+  uint8_t eveningM;
+  uint8_t eveningHP;
+  uint8_t eveningCP;
+  uint8_t fan_length;
+  uint8_t fan_beginh;
+  uint8_t fan_stoph;
+} 
+config;
+
+//  Initialize DHT sensor storage variables
+byte humidity; // humidity in % - read from sensor
+float f_temperature; // floating temp in F for calculations
+byte d_temperature; //integer temp in F for display
+byte heat_index;
+
+//  Define Relay PINs
+# define heatRelayPin 2
+# define coolRelayPin 15
+# define fanRelayPin 16
+# define blPin 7
+
+//  Define Switch PINs
+# define onOffSwitchPin 17 //configured for INPUT_PULLUP - on is HIGH (1), off is LOW (0)
+# define heatCoolButtonPin 6 //configured for INPUT_PULLUP - heat is HIGH (1), cool if LOW (0)
+# define menuPin A6
+# define touchPin 8 //capacitive touch pin for backlight control
+
+/**************** END DEFINITIONS *************************************************************************/
+
+/**************** BEGIN SETUP *****************************************************************************/
+void setup() {
+  sprintf(displayNode,"%s",addresses[nodeNum]);//put the node number into a character array for use in the makedisplay function
+  Serial.begin(115200);
+#if defined(DEBUG)
+  printf_begin();
+  Serial.print("DEBUG ENABLED");
+  delay(5000);
+#endif
+
+  //  start LCD display 
+  display.begin();
+  delay(1000);
+  display.clearDisplay();
+  display.display(); 
+  Wire.begin();
+
+#if defined(INIT_CONFIG)
+  morningHour = 07;
+  morningMinute = 30;
+  morningHeatSetPoint = 70;
+  morningCoolSetPoint = 75;
+  eveningHour = 23;
+  eveningMinute = 30;
+  eveningHeatSetPoint = 68;
+  eveningCoolSetPoint = 75;
+  fan_run_length = 15;
+  fan_start_hour = 0;
+  fan_stop_hour = 24;
+  config_store config = { 
+    morningHour, morningMinute, morningHeatSetPoint, morningCoolSetPoint, eveningHour, eveningMinute,  eveningHeatSetPoint, eveningCoolSetPoint, fan_run_length, fan_start_hour, fan_stop_hour  }; 
+  EEPROM_writeAnything(0, config);
+  RTC.adjust(DateTime(__DATE__, __TIME__)); /* initialize the RTC with the system date and time if the RTC reports NOT STARTED */
+#endif
+
+  //  Start the real-time clock
+  RTC.begin();
+#if defined (debug)
+  if (! RTC.isrunning()) {// tell us if the real-time clock is running or not
+    display.print(F("RTC NOT STARTED!"));
+  }
+  else {
+    display.setCursor(0,16);
+    display.print(F("RTC Started"));
+  }
+  display.display();
+  delay(1000);
+#endif
+
+  //  set PinModes for inputs and outputs
+  pinMode(heatRelayPin, OUTPUT);
+  pinMode(coolRelayPin, OUTPUT);
+  pinMode(fanRelayPin, OUTPUT);
+  pinMode(onOffSwitchPin, INPUT_PULLUP);
+  pinMode(heatCoolButtonPin, INPUT_PULLUP);
+  pinMode(blPin, OUTPUT);  
+  digitalWrite(blPin, HIGH);
+
+  //  initiailize relay states to OFF
+  digitalWrite(heatRelayPin, LOW);
+  digitalWrite(coolRelayPin, LOW);
+  digitalWrite(fanRelayPin, LOW);
+
+  //  initialize tempCheckMils timer for first run
+  tempCheckMils = millis() + 1000;
+
+  //  initialize 5 minute compressor lock-out timer for first run
+  conpressorCheckMils = (millis() + (300000));
+
+  //  initialize transmit timer for first run
+  xmitMils = millis() + 2000;
+
+  fanCheckMils = millis() + 3000;
+
+  //  start the radio
+  radio.begin();
+
+  // Set radio parameters
+  radio.enableDynamicPayloads();
+  radio.setAutoAck(1);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_MAX);
+  radio.setChannel(80);
+  radio.setRetries(15,15);
+  radio.setCRCLength(RF24_CRC_8);
+
+  // open radio reading and writing pipes with this nodes' number
+  radio.openWritingPipe(addresses[nodeNum]);
+  radio.openReadingPipe(1,addresses[nodeNum]);
+  delay(100);
+
+#if defined(DEBUG)
+  radio.printDetails(); 
+  delay(5000);
+#endif
+  // Start listening for data
+  radio.startListening();
+
+  //  Read values from EEPROM and store in config variables at start-up
+  readConfig();
+
+  //  Initialize schedule variable for first run
+  update_date();
+  createDateString();
+  if ((hours == morningHour && minutes >= morningMinute || hours > morningHour) && (hours < eveningHour || hours == eveningHour && minutes < eveningMinute)){//morning schedule
+    lastSched = 0;
+  }
+  else {
+    lastSched = 1;
+  }//evening schedule
+  schedCheckMils = millis();
+
+  //  Clear Display
+  display.clearDisplay();
+  display.display();
+
+
+}
+/**************** END SETUP ******************************************************************************/
+
+/**************** BEGIN MAIN LOOP ************************************************************************/
+void loop() {
+  /**** BACKLIGHT CHECK MODULE ****/
+  if ((readCapacitivePin(touchPin) >10) && digitalRead(blPin)){
+    digitalWrite(blPin, LOW);
+    backLightMils = millis() + 10000;}
+  else if (!digitalRead(blPin) && ((long) (millis() - backLightMils) >=0)){
+    digitalWrite(blPin, HIGH);}
+  /**** END BACKLIGHT CHECK MODULE ****/
+  
+  /**** SCHEDULE CHECK MODULE ****/
+  if ((long) (millis() - daysUpCheckMils) >=0){
+    daysUpCount++; 
+    daysUpCheckMils = millis() + 86400000;
+  }//count numer of days since reset
+  if ((long) (millis() - schedCheckMils) >=0){ //set current schedule based on current time
+    update_date();
+    if ((hours == morningHour && minutes >= morningMinute || hours > morningHour) && (hours < eveningHour || hours == eveningHour && minutes < eveningMinute)){//if daytime schedule, set morning heat/cool points to active
+      whichSched = 1;
+      if (!lastSched){
+        lastSched = 1;
+        readConfig();
+        heat_set_point = morningHeatSetPoint;
+        cool_set_point = morningCoolSetPoint;
+        tempTemp = 0;//turn off the temporary temperature indicator if the schedule just changed
+        displayUpdateMils = millis();//update display if the schedule just changed
+        tempCheckMils = millis();//check temperature if the schedule just changed
+      }
+    }  
+    else { //if night schedule, set evening heat/cool points to active
+      whichSched = 0;
+      if (lastSched){ 
+        lastSched = 0;
+        readConfig();
+        heat_set_point = eveningHeatSetPoint;
+        cool_set_point = eveningCoolSetPoint;
+        tempTemp = 0;//turn off the temporary temperature indicator if the schedule just changed
+        displayUpdateMils = millis();
+        tempCheckMils = millis();
+      }
+    }
+    schedCheckMils = millis() + 60000;//wait 60s before checking the schedule again
+  }
+  /**** END SCHEDULE CHECK MODULE ****/
+ 
+  /**** BT SERIAL CHECK MODULE ****/ 
+  #if defined(BLUETOOTH)
+    if (Serial.available()){
+      getSerial();
+    }
+  #endif
+  /**** END BT SERIAL CHECK MODULE ****/
+
+  /**** RADIO RECEIVE MODULE ****/
+  if (radio.available()){//check for a message waiting and retrieve it
+    getMessage();
+    schedCheckMils = millis();
+    tempCheckMils = millis();
+    displayUpdateMils = millis();
+    fanCheckMils = millis();
+  }
+  /**** END RADIO RECEIVE MODULE ****/
+
+  /**** MENU MODULE ****/
+  if (analogRead(menuPin) > 100){//if one of the 3 menu button was pressed, go to menu function
+    menuFunction();
+    displayUpdateMils = millis();;
+  }
+  /**** END MENU MODULE ****/
+
+  /**** HEAT/COOL MODULE ****/
+  if (digitalRead(onOffSwitchPin)){ //check to see if on-off switch is on
+    onOffState = digitalRead(onOffSwitchPin);
+    if (hours != currentHour){//put cyclecount in previouscyclecount and reset cyclecount to 0
+      currentHour = hours;
+      previousCycleCount = cycleCount;
+      cycleCount = 0;
+    }
+    if (!previousOnOffState){
+      tempCheckMils = millis();
+      displayUpdateMils = millis();
+    }
+    checkHCbutton();  // check to see if heat-cool button is being pressed
+    if ((long)(millis() - tempCheckMils) >= 0){//check temp and set heat/cool cycle every minute
+      switch (heatCoolStatus){
+      case 0://heat cycle
+        heatCycle();
+
+        break;
+      case 1://cool cycle
+        coolCycle();
+
+        break;
+      }
+      tempCheckMils = (millis() + (30000));
+    }
+    previousOnOffState = onOffState;
+  }
+  else {
+    onOffState = digitalRead(onOffSwitchPin);
+    if (previousOnOffState){
+      digitalWrite(heatRelayPin, LOW);
+      digitalWrite(coolRelayPin, LOW);
+      conpressorCheckMils = millis() + 300000;
+      updateDisplay();
+    }
+    previousOnOffState = onOffState;
+  }
+  /**** END HEAT COOL MODULE ****/
+
+  /**** CIRCULATION FAN MODULE ****/
+  if (fan_run_length > 0 && !digitalRead(heatRelayPin) && !digitalRead(coolRelayPin) && ((long)(millis() - fanCheckMils) >= 0)){//check fan status every minute if furnance and AC are NOT running
+    checkFan();
+  }
+  /**** CIRCULATION FAN MODULE  ****/
+
+  /**** RADIO SEND MODULE ****/
+  if ((long)(millis() - xmitMils) >= 0) {//transmit status and config packet to central hub every 5 minutes
+    makeStatusBinary();
+    xmitMils = millis() + 300000;
+  }
+  /**** END RADIO SEND MODULE ****/
+
+  /**** UPDATE DISPLAY MODULE ****/
+  if ((long) (millis() - displayUpdateMils) >=0) {//update display every 30 seconds
+    updateDisplay();
+  }
+  /**** END UPDATE DISPLAY MODULE ****/
+}
+/**************** END MAIN LOOP **************************************************************************/
+
+/**************** BEGIN FUNCTION DEFINITIONS *************************************************************/
+void makeStatusBinary(){
+  byte outBufferBin[12];
+  outBufferBin[0] = nodeNum;
+  outBufferBin[1] = 0;//packet type = status
+  outBufferBin[2] = d_temperature;
+  outBufferBin[3] = humidity;
+  outBufferBin[4] = heat_index;
+  outBufferBin[5] = digitalRead(onOffSwitchPin);
+  outBufferBin[6] = heatCoolStatus;
+  outBufferBin[7] = override;
+  outBufferBin[8] = digitalRead(heatRelayPin);
+  outBufferBin[9] = digitalRead(coolRelayPin);
+  outBufferBin[10] = digitalRead(fanRelayPin);
+  sendRadio(outBufferBin, 12);
+}
+
+void makeConfigBinary(){
+  byte outBufferBin[14];
+  outBufferBin[0] = nodeNum;
+  outBufferBin[1] = 1;//packet type = config
+  outBufferBin[2] = morningHour;
+  outBufferBin[3] = morningMinute;
+  outBufferBin[4] = morningHeatSetPoint;
+  outBufferBin[5] = morningCoolSetPoint;
+  outBufferBin[6] = eveningHour;
+  outBufferBin[7] = eveningMinute;
+  outBufferBin[8] = eveningHeatSetPoint;
+  outBufferBin[9] = eveningCoolSetPoint;
+  outBufferBin[10] = fan_run_length;
+  outBufferBin[11] = fan_start_hour;
+  outBufferBin[12] = fan_stop_hour;
+  sendRadio(outBufferBin, 14);
+}
+
+void readSensor() { //read DHT sensor
+  float h = dht.readHumidity();
+  f_temperature = (dht.readTemperature(true) + tempOffSet);
+  float hi = dht.computeHeatIndex(f_temperature, humidity);
+  d_temperature = f_temperature;
+  humidity = h;
+  heat_index = hi;
+}
+
+void sendRadio(byte outBuffer[], uint8_t len){
+  radio.stopListening();
+  if ( radio.write( outBuffer, (len))) {
+    sendStatus = "Send Success";
+    strcpy(sendTimeStamp,dateString);
+  } 
+  else {
+    sendStatus = "Send Failed";
+  }
+  radio.startListening();
+}
+
+void checkHCbutton(){ //check heat/cool button
+  int HCbuttonReading = digitalRead(heatCoolButtonPin);
+  // If the switch changed, due to noise or pressing:
+  if (HCbuttonReading != lastHCbuttonState) {
+    // reset the debouncing timer
+    lastHCdebounceTime = millis() + 50;
+  } 
+  if ((long)(millis() - lastHCdebounceTime) >= 0) {//debounce heat/cool button
+    if (HCbuttonReading != HCbuttonState) {
+      HCbuttonState = HCbuttonReading;
+      if (HCbuttonState == LOW) {
+        heatCoolStatus = !heatCoolStatus; //switch heat/cool status
+
+          //read config from EEPROM and set heat/cool set points
+        readConfig();
+        if (whichSched){
+          heat_set_point = morningHeatSetPoint;
+          cool_set_point = morningCoolSetPoint;
+        }
+        else {
+          heat_set_point = eveningHeatSetPoint;
+          cool_set_point = eveningCoolSetPoint;
+        }
+        tempTemp = 0;
+        displayUpdateMils = millis();
+        tempCheckMils = millis();
+      }
+    }
+  }
+  lastHCbuttonState = HCbuttonReading;
+}
+
+void heatCycle(){
+  if (digitalRead(coolRelayPin)){//check to see if COOL relay is on and turn off before turning on HEAT relay
+    digitalWrite(coolRelayPin, LOW);
+    //set AC compressor lock-out to 5 minutes
+    conpressorCheckMils = (millis() + (300000));//if we just turned off the AC, reset compressor lock-out time to 5 minutes
+  }
+  readSensor();
+  //check conditions to update HEAT relay state
+  if ((f_temperature < (heat_set_point - swingTemp) && !digitalRead(heatRelayPin)) || (override && !digitalRead(heatRelayPin))){
+    if (digitalRead(fanRelayPin)){
+      digitalWrite(fanRelayPin, LOW);
+    }//turn fan relay off before turning on HEAT relay
+    digitalWrite(heatRelayPin, HIGH);//turn furnance on
+    cycleCount++;
+
+  }
+  else if (f_temperature >= (heat_set_point + swingTemp) && digitalRead(heatRelayPin) && !override){
+    digitalWrite(heatRelayPin, LOW);//turn furnace off
+  }
+}
+
+void coolCycle(){ 
+  if (digitalRead(heatRelayPin)){//check to see if HEAT relay is on and turn off before switching to COOL mode
+    digitalWrite(heatRelayPin, LOW);
+  }
+  lockOutStat = "";
+  readSensor();
+  if ((f_temperature > (cool_set_point + swingTemp) && !digitalRead(coolRelayPin) && ((long)( millis() - conpressorCheckMils ) >= 0)) || (override && ((long)( millis() - conpressorCheckMils ) >= 0) && !digitalRead(coolRelayPin))){
+    if (digitalRead(fanRelayPin)){
+      digitalWrite(fanRelayPin, LOW);
+    }//turn fan relay off before turning on AC relay
+    digitalWrite(coolRelayPin, HIGH);//turn AC on
+    cycleCount++;
+    lockOutStat = "";
+  }
+  else if ((f_temperature > (cool_set_point + swingTemp)) && (!digitalRead(coolRelayPin) && (long)( millis() - conpressorCheckMils ) <= 0) || (override && ((long)( millis() - conpressorCheckMils ) <= 0) && !digitalRead(coolRelayPin))){//check to see if lock-out conditions are met
+    lockOutStat = "lock";
+  }
+  else if (f_temperature <= (cool_set_point - swingTemp) && digitalRead(coolRelayPin) && !override){
+    digitalWrite(coolRelayPin, LOW);//turn AC off
+    conpressorCheckMils = millis() + 300000;
+  }
+}
+
+void getMessage() { //receive message from hub
+  uint8_t payload_size = radio.getDynamicPayloadSize();  
+  char recConfig[payload_size];
+  radio.read( recConfig, sizeof(recConfig) );
+  if (payload_size == 5){
+    if (recConfig[0] == 99){ //check to see if system commanded into override mode
+      override = recConfig[1];
+    }
+    else if (recConfig[0] == 98){//check to see if commanded to switch heat/cool mode
+      heatCoolStatus = recConfig[1];
+    }
+    strcpy(recTimeStamp,dateString);
+  }
+  else if (payload_size == 32) {  //check to see if if new configuration received, store it.
+    //Serial.printf("Received: %i,%i,%i,%i,%i,%i,%i,%i,%i,%i,%i \n", recConfig[0], recConfig[1], recConfig[2], recConfig[3], recConfig[4], recConfig[5], recConfig[6], recConfig[7], recConfig[8], recConfig[9], recConfig[10]);
+    config_store config = { recConfig[0], recConfig[1], recConfig[2], recConfig[3], recConfig[4], recConfig[5], recConfig[6], recConfig[7], recConfig[8], recConfig[9], recConfig[10] }; 
+    EEPROM_writeAnything(0, config);
+    readConfig();
+    if (whichSched){
+      heat_set_point = morningHeatSetPoint;
+      cool_set_point = morningCoolSetPoint;
+    }
+    else {
+      heat_set_point = eveningHeatSetPoint;
+      cool_set_point = eveningCoolSetPoint;
+    }
+    strcpy(recTimeStamp,dateString);
+  }
+  else {
+    strcpy(recTimeStamp,errorString);
+  }
+}
+
+void updateDisplay(){
+  readSensor();
+  update_date();
+  createDateString();
+  display.clearDisplay();
+  if (digitalRead(onOffSwitchPin)){
+    if (heatCoolStatus){//if system is in COOL mode (1) print lock-out status
+      display.setTextSize(1);
+      display.setCursor(0,0);
+      display.print(lockOutStat);
+      heatCoolStat = "C";
+      if (!override){
+        display.setCursor(32,0);
+        display.print(cool_set_point);
+      }
+      if (digitalRead(coolRelayPin)) {
+        display.drawBitmap(15, 7, snow, 16, 18, 1);
+      }
+    }
+    else {
+      heatCoolStat = "H";
+      display.setTextSize(1);
+      if (!override){
+        display.setCursor(32,0);
+        display.print(heat_set_point);
+      }
+      if (digitalRead(heatRelayPin)) {
+        display.drawBitmap(15, 7, fire, 16, 18, 1);
+      }
+    }
+    if (override){
+      display.setTextSize(1);
+      display.setCursor(30,0);
+      display.print(F("OV!"));
+    }
+    else {
+      if (tempTemp) {
+        display.setCursor(26,0);
+        display.print(F("t"));
+      }
+      else {
+        display.setCursor(26,0);
+        if (whichSched){
+          display.print(F("D"));
+        }
+        else {
+          display.print(F("N"));
+        }
+      }
+    }  
+    display.setTextSize(2);
+    display.setCursor(0,10);
+    display.print(heatCoolStat);
+  }
+  else {
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.print(F("OFF"));
+    heatCoolStat = ""; 
+  }
+  if (digitalRead(fanRelayPin)){
+    display.drawBitmap(13, 9, fan, 16, 16, 1);
+  }
+  if (fan_run_length > 0){
+    display.setTextSize(0);
+    display.setCursor(30,17);
+    display.print(fan_run_length);
+  }
+  display.setCursor(48,2);
+  display.setTextSize(3);
+  display.print(d_temperature);
+  display.setTextSize(0);
+  display.setCursor(0,28);
+  display.print(dateString);
+  display.setCursor(5,38);
+  display.print("Hu:");
+  display.print(humidity);
+  display.setCursor(44,38);
+  display.print("Hi:");
+  display.print(heat_index);
+  //display.print(sendStatus);
+  display.display();
+  displayUpdateMils = millis() +30000;
+}
+
+void update_date(){ //function to update the time/date line of display
+  DateTime now = RTC.now();
+  hours = (now.hour());
+  minutes = (now.minute());
+  days = (now.day());
+  switch (now.month()) {
+  case 1: 
+    month_result = "Jan"; 
+    break;
+  case 2: 
+    month_result = "Feb"; 
+    break;
+  case 3: 
+    month_result = "Mar"; 
+    break;
+  case 4: 
+    month_result = "Apr"; 
+    break;
+  case 5: 
+    month_result = "May"; 
+    break;
+  case 6: 
+    month_result = "Jun"; 
+    break;
+  case 7: 
+    month_result = "Jul"; 
+    break;
+  case 8: 
+    month_result = "Aug"; 
+    break;
+  case 9: 
+    month_result = "Sep"; 
+    break;
+  case 10: 
+    month_result = "Oct"; 
+    break;
+  case 11: 
+    month_result = "Nov"; 
+    break;
+  case 12: 
+    month_result = "Dec"; 
+    break;
+  }
+} 
+
+void createDateString(){
+  char buffer3[3] = "";
+  char tempString[15] = "";
+  uint8_t displayHours;
+  if (hours >= 0 && hours <= 11){
+    am_pm = "AM";
+    if (hours == 0) {
+      displayHours = 12;
+    }
+    else {
+      displayHours = hours;
+    }
+  }
+  else {
+    am_pm = "PM";
+    if (hours >=13) { 
+      displayHours = hours - 12;
+    }
+    else {
+      displayHours = hours;
+    }
+  }
+  strcat(tempString,month_result);
+  strcat(tempString," ");
+  strcat(tempString,dtostrf(days, 1,0, buffer3));
+  strcat(tempString," ");
+  strcat(tempString,dtostrf(displayHours, 1,0, buffer3));
+  strcat(tempString,":");
+  if (minutes < 10){
+    strcat(tempString,"0");
+  }
+  strcat(tempString,dtostrf(minutes, 1,0, buffer3));
+  strcat(tempString,am_pm);
+  strcpy(dateString,tempString);
+}
+
+void checkFan(){  //check to see if circulation fan should be on or off
+  update_date();
+  if (hours >= fan_start_hour && hours < fan_stop_hour && minutes < fan_run_length && !digitalRead(fanRelayPin)){
+    digitalWrite(fanRelayPin, HIGH);
+    updateDisplay();
+  }
+  else if ((hours < fan_start_hour || hours >= fan_stop_hour || minutes >= fan_run_length) && digitalRead(fanRelayPin)){
+    digitalWrite(fanRelayPin, LOW);
+    updateDisplay();
+  }
+  fanCheckMils = millis() +60000;
+}
+
+void menuFunction(){  //menu function
+  if (digitalRead(blPin)){
+    digitalWrite(blPin, LOW);}
+  whichConfigVar = 0;
+  commitConfig = 0;
+  menuPinValue = analogRead(menuPin);
+  bool changeVar = 0;
+  if (menuPinValue > 1000){
+      previousMenuPinValue = menuPinValue;
+      whichConfigVar = 3;
+      printWhichVar = "Day Cool Set";
+      configVariable = morningCoolSetPoint;
+      menuTimeoutMils = millis() + 6000;//set menu timeout value
+      display.clearDisplay();
+      display.setTextSize(0);
+      display.setCursor(0,0);
+      display.print(F("Main Menu"));
+      display.setCursor(0,16);
+      display.print(printWhichVar);
+      display.setCursor(0,26);
+      display.print(configVariable);
+      display.setCursor(22,34);
+      display.print("Select");
+      display.drawBitmap(60, 30, c_select, 16, 16, 1);
+      display.display();
+      menuDebouceMils = millis()+ 200;
+      do {
+        menuPinValue = analogRead(menuPin);
+        delay(50);
+        if (menuPinValue > 100 && previousMenuPinValue < 100 && ((long) (millis() - menuDebouceMils) >= 0)) {//debounce
+          menuDebouceMils = millis() + 200;
+          display.clearDisplay();
+          display.setTextSize(0);
+          display.setCursor(0,0);
+          display.print(F("Main Menu"));
+          if (menuPinValue < 300 && menuPinValue >100) {//increment menu selection
+            whichConfigVar++;
+            if (whichConfigVar == 18){
+              whichConfigVar = 3;
+            }
+            menuTimeoutMils = millis() + 6000;
+          }
+          if (menuPinValue > 400 && menuPinValue < 1000) {//decrement menu selection
+            whichConfigVar--;
+            if (whichConfigVar == 2){
+              whichConfigVar = 17;
+            }
+            menuTimeoutMils = millis() + 6000;
+          }
+          if (menuPinValue > 1000) {//commit changes
+             changeVar = 1;
+             break;      
+          }
+          switch(whichConfigVar){
+          case 3:
+            printWhichVar = "Day Cool Set";
+            configVariable = morningCoolSetPoint;
+            break;
+          case 4:
+            printWhichVar = "Day Heat Set";
+            configVariable = morningHeatSetPoint;
+            break;
+          case 5:
+            printWhichVar = "Nght Cool Set";
+            configVariable = eveningCoolSetPoint;
+            break;
+          case 6:
+            printWhichVar = "Nght Heat Set";
+            configVariable = eveningHeatSetPoint;
+            break;
+          case 7:
+            printWhichVar = "Day Start Hour";
+            configVariable = morningHour;
+            break;
+          case 8:
+            printWhichVar = "Day Start Min";
+            configVariable = morningMinute;
+            break;
+          case 9:
+            printWhichVar = "Nght Start Hr";
+            configVariable = eveningHour;
+            break;
+          case 10:
+            printWhichVar = "Nght Start Min";
+            configVariable = eveningMinute;
+            break;
+          case 11:
+            printWhichVar = "Fan Run Time";
+            configVariable = fan_run_length;
+            break;
+          case 12:
+            printWhichVar = "Fan Start Hour";
+            configVariable = fan_start_hour;
+            break;
+          case 13:
+            printWhichVar = "Fan End Hour";
+            configVariable = fan_stop_hour;
+            break;
+          case 14:
+            printWhichVar = "Swing Temp";
+            floatConfigVariable = swingTemp;
+            break;
+          case 15:
+            printWhichVar = "Temp Offset";
+            floatConfigVariable = tempOffSet;
+            break;
+          case 16:
+            printWhichVar = "Radio INFO";
+            break;
+          case 17:
+            printWhichVar = "System INFO";
+            break;
+        }
+        display.setTextSize(0);
+        display.setCursor(0,16);
+        display.print(printWhichVar);
+        if (whichConfigVar < 14){
+          display.setCursor(0,26);
+          display.print(configVariable);
+        }
+        if (whichConfigVar > 13 && whichConfigVar < 16){
+          display.setCursor(0,26);
+          display.print(floatConfigVariable);
+        }
+        display.setCursor(22,34);
+        display.print("Select");
+        display.drawBitmap(60, 30, c_select, 16, 16, 1);
+        display.display();
+      }
+      previousMenuPinValue = menuPinValue;
+      } while ((long)(millis() - menuTimeoutMils) < 0);
+      if (whichConfigVar == 16 && changeVar){
+        bool recycleMenu = 0;
+        display.clearDisplay();
+        display.setTextSize(0);
+        display.setCursor(0,0);
+        display.print("Addr:");
+        display.print(displayNode);
+        display.setCursor(0,8);
+        display.print("Last Xmit:");
+        display.setCursor(0,16);
+        display.print(sendTimeStamp);
+        display.setCursor(0,24);
+        display.print("Last Rec:");
+        display.setCursor(0,32);
+        display.print(recTimeStamp);
+        display.setCursor(44,40);
+        display.print("Back");
+        display.drawBitmap(68, 39, small_select, 16, 9, 1);
+        display.display();
+        unsigned long sysInfoMils = millis()+ 10000;
+        unsigned long menuExitDebounceMils = millis() + 300;
+        do{
+          uint16_t menuExitValue = analogRead(menuPin);
+          if (menuExitValue > 1000 && ((long)(millis() - menuExitDebounceMils) >= 0)){
+            recycleMenu = 1;
+            break;
+          }
+        } while ((long)(millis() - sysInfoMils) < 0);
+        if (recycleMenu){
+          menuFunction();
+        }
+        changeVar = 0;
+        commitConfig = 0;
+      }
+      if (whichConfigVar == 17 && changeVar){
+        bool recycleMenu = 0;
+        display.clearDisplay();
+        display.setTextSize(0);
+        display.setCursor(0,0);
+        display.print("Code Ver:");
+        display.print(codeVersion);
+        display.setCursor(0,8);
+        display.print("Days Up:");
+        display.print(daysUpCount);
+        display.setCursor(0,16);
+        display.print("Cur Cyc/Hour");
+        display.print(cycleCount);
+        display.setCursor(0,24);
+        display.print("Prev Cyc/Hour");
+        display.print(previousCycleCount);
+        display.setCursor(44,40);
+        display.print("Back");
+        display.drawBitmap(68, 39, small_select, 16, 9, 1);
+        display.display();
+        unsigned long sysInfoMils = millis()+ 10000;
+        unsigned long menuExitDebounceMils = millis() + 300;
+        do{
+          uint16_t menuExitValue = analogRead(menuPin);
+          if (menuExitValue > 1000 && ((long)(millis() - menuExitDebounceMils) >= 0)){
+            recycleMenu = 1;
+            break;
+          }
+        } while ((long)(millis() - sysInfoMils) < 0);
+        if (recycleMenu){
+          menuFunction();
+        }
+        changeVar = 0;
+        commitConfig = 0;
+      }
+      if (changeVar){
+      updateConfigVariable();
+      }
+      if (commitConfig){
+        switch(whichConfigVar){
+          case 3:
+            morningCoolSetPoint = configVariable;
+            break;
+          case 4:
+            morningHeatSetPoint = configVariable;
+            break;
+          case 5:
+            eveningCoolSetPoint = configVariable;
+            break;
+          case 6:
+            eveningHeatSetPoint = configVariable;
+            break;
+          case 7:
+            morningHour = configVariable;
+            break;
+          case 8:
+            morningMinute = configVariable;
+            break;
+          case 9:
+            eveningHour = configVariable;
+            break;
+          case 10:
+            eveningMinute = configVariable;
+            break;
+          case 11:
+            fan_run_length = configVariable;
+            if (fan_run_length == 0 && digitalRead(fanRelayPin)){
+              digitalWrite(fanRelayPin, LOW);
+            }
+            break;
+          case 12:
+            fan_start_hour = configVariable;
+            break;
+          case 13:
+            fan_stop_hour = configVariable;
+            break;
+          case 14:
+            swingTemp = floatConfigVariable;
+            break;
+          case 15:
+            tempOffSet = floatConfigVariable;
+            break;
+        }
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.setTextSize(0);
+        display.println(F("Store Config"));
+        display.display();
+        config_store config = { morningHour, morningMinute, morningHeatSetPoint, morningCoolSetPoint, eveningHour, eveningMinute,  eveningHeatSetPoint, eveningCoolSetPoint, fan_run_length, fan_start_hour, fan_stop_hour}; 
+        EEPROM_writeAnything(0, config);
+        display.setCursor(0,8);
+        display.println(F("Done!"));
+        display.display();
+        delay(500);
+        if (whichSched){
+          heat_set_point = morningHeatSetPoint;
+          cool_set_point = morningCoolSetPoint;
+        }
+        else {
+          heat_set_point = eveningHeatSetPoint;
+          cool_set_point = eveningCoolSetPoint;
+        }
+        schedCheckMils = millis();//force a schedule check if we just changed the config
+        tempCheckMils = millis();//force a temp check if we just changed the config
+        fanCheckMils = millis();//force a fan check if we just changed the config
+      }
+  }
+  else {
+    if (heatCoolStatus){
+      
+      whichConfigVar = 2;
+    }
+    else {
+      
+      whichConfigVar = 1;
+    }
+    menuTimeoutMils = millis() + 4000;//set menu timeout value
+    
+    updateConfigVariable();
+    if (heatCoolStatus){
+      cool_set_point = configVariable;
+    }
+    else {
+      heat_set_point = configVariable;
+    }
+    if (commitConfig){
+      if (whichSched){
+        morningHeatSetPoint = heat_set_point;
+        morningCoolSetPoint = cool_set_point;
+      }
+      else {
+        eveningHeatSetPoint = heat_set_point;
+        eveningCoolSetPoint - cool_set_point;
+      }
+      config_store config = { morningHour, morningMinute, morningHeatSetPoint, morningCoolSetPoint, eveningHour, eveningMinute,  eveningHeatSetPoint, eveningCoolSetPoint, fan_run_length, fan_start_hour, fan_stop_hour}; 
+      EEPROM_writeAnything(0, config);
+      display.setTextSize(0);
+      display.setCursor(0, 16);
+      display.println(F("Changes"));
+      display.print(F("Saved"));
+      display.display();
+      tempTemp = 0;//turn off temporary temperature indicator if we committed the new heat/cool set point
+      delay(500);
+      tempCheckMils = millis();//force a temp check if we just updated the current heat/cool set point
+    }
+    else {
+      tempTemp = 1;//turn on the temporary temperature indicator if we didn't committ the new heat/cool set point - it will be lost if schedule changes or heat/cool setting changes.
+    }
+  }
+  digitalWrite(blPin, HIGH);
+}
+ 
+void updateConfigVariable(){  //update variables - sub-function of menu function
+  float configUpperLimit;
+  float configLowerLimit;
+  float configIncrements;
+  switch (whichConfigVar) {
+    case 1:
+      printWhichVar = "Heat Set Point";
+      configVariable = heat_set_point;
+      configUpperLimit = heatSetPointUpperLimit;
+      configLowerLimit = heatSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 2:
+      printWhichVar = "Cool Set Point";
+      configVariable = cool_set_point;
+      configUpperLimit = coolSetPointUpperLimit;
+      configLowerLimit = coolSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 3:
+      configUpperLimit = coolSetPointUpperLimit;
+      configLowerLimit = coolSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 4:
+      configUpperLimit = heatSetPointUpperLimit;
+      configLowerLimit = heatSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 5:
+      configUpperLimit = coolSetPointUpperLimit;
+      configLowerLimit = coolSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 6:
+      configUpperLimit = heatSetPointUpperLimit;
+      configLowerLimit = heatSetPointLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 7:
+      configUpperLimit = setHoursUpperLimit;
+      configLowerLimit = setHoursLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 8:
+      configUpperLimit = setMinutesUpperLimit;
+      configLowerLimit = setMinutesLowerLimit;
+      configIncrements = setMinutesIncrement;
+      break;
+    case 9:
+      configUpperLimit = setHoursUpperLimit;
+      configLowerLimit = setHoursLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 10:
+      configUpperLimit = setMinutesUpperLimit;
+      configLowerLimit = setMinutesLowerLimit;
+      configIncrements = setMinutesIncrement;
+      break;
+    case 11:
+      configUpperLimit = fanRunLengthUpperLimit;
+      configLowerLimit = fanRunLengthLowerLimit;
+      configIncrements = setMinutesIncrement;
+      break;
+    case 12:
+      configUpperLimit = setHoursUpperLimit;
+      configLowerLimit = setHoursLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 13:
+      configUpperLimit = setHoursUpperLimit;
+      configLowerLimit = setHoursLowerLimit;
+      configIncrements = setOtherIncrement;
+      break;
+    case 14:
+      configUpperLimit = setSwingTempUpperLimit;
+      configLowerLimit = setSwingTempLowerLimit;
+      configIncrements = setSwingTempIncrements;
+      break;
+    case 15:
+      configUpperLimit = setTempOffSetUpperLimit;
+      configLowerLimit = setTempOffSetLowerLimit;
+      configIncrements = setTempOffSetIncrements;
+      break;
+  }
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(0);
+  display.print(printWhichVar);
+  display.drawBitmap(65, 8, c_up, 16, 14, 1);
+  display.drawBitmap(65, 31, c_down, 16, 14, 1);
+  //display.drawBitmap(20, 33, c_select, 16, 16, 1);
+  display.setCursor(8,17);
+  display.setTextSize(2);
+  if (whichConfigVar < 14){
+    display.print(configVariable);
+  }
+  else {
+    display.print(floatConfigVariable);
+  }
+  display.display();
+  previousMenuPinValue = menuPinValue;
+  do {
+    menuPinValue = analogRead(menuPin);
+    delay(50);
+    if (menuPinValue > 100 && previousMenuPinValue < 100 && ((long) (millis() - menuDebouceMils) >= 0)) {//debounce
+      menuDebouceMils = millis() + 250;
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.setTextSize(0);
+      display.print(printWhichVar);
+      display.drawBitmap(65, 8, c_up, 16, 14, 1);
+      display.drawBitmap(65, 31, c_down, 16, 14, 1);
+      display.drawBitmap(45, 33, c_select, 16, 16, 1);
+      display.setTextSize(0);
+      display.setCursor(20, 37);
+      display.print(F("save"));
+      display.display();
+      if (menuPinValue < 300 && menuPinValue > 100) {//increment config variable setting
+        /* increment config variable code */
+        if (whichConfigVar < 14){
+          if (configVariable < configUpperLimit){configVariable = configVariable + configIncrements;}
+          if (configVariable == configUpperLimit){configVariable = configVariable;}
+            display.setTextSize(2);
+            display.setCursor(8,17);
+            display.print(configVariable);
+            display.display();
+            menuTimeoutMils = millis() + 4000;
+        }
+        else {
+          if (floatConfigVariable < configUpperLimit){floatConfigVariable = floatConfigVariable + configIncrements;}
+          if (floatConfigVariable == configUpperLimit){floatConfigVariable = floatConfigVariable;}
+            display.setTextSize(2);
+            display.setCursor(8,17);
+            display.print(floatConfigVariable);
+            display.display();
+            menuTimeoutMils = millis() + 4000;
+        }
+      }
+      if (menuPinValue > 400 && menuPinValue < 1000) {//decrement config variable setting
+        /* decrement config variable code*/
+        if (whichConfigVar < 14){
+          if (configVariable > configLowerLimit){configVariable = configVariable - configIncrements;}
+          if (configVariable == configLowerLimit){configVariable = configVariable;}
+            display.setTextSize(2);
+            display.setCursor(8,17);
+            display.print(configVariable);
+            display.display();
+            menuTimeoutMils = millis() + 4000;
+        }
+        else {
+          if (floatConfigVariable > configLowerLimit){floatConfigVariable = floatConfigVariable - configIncrements;}
+          if (floatConfigVariable == configLowerLimit){floatConfigVariable = floatConfigVariable;}
+            display.setTextSize(2);
+            display.setCursor(8,17);
+            display.print(floatConfigVariable);
+            display.display();
+            menuTimeoutMils = millis() + 4000;
+        }
+      }
+      if (menuPinValue > 1000) {//commit changes
+        commitConfig = 1;
+        break;
+      }
+    }
+  previousMenuPinValue = menuPinValue;
+  } while ((long)(millis() - menuTimeoutMils) < 0);
+}
+
+void readConfig(){  //read config from EEPROM and store in global variables
+  EEPROM_readAnything(0, config);
+  morningHour = config.morningH;
+  morningMinute = config.morningM;
+  morningHeatSetPoint = config.morningHP;
+  morningCoolSetPoint = config.morningCP;
+  eveningHour = config.eveningH;
+  eveningMinute = config.eveningM;
+  eveningHeatSetPoint = config.eveningHP;
+  eveningCoolSetPoint = config.eveningCP;
+  fan_run_length = config.fan_length;
+  fan_start_hour = config.fan_beginh;
+  fan_stop_hour = config.fan_stoph;
+}
+
+uint8_t readCapacitivePin(int pinToMeasure) {
+  // Variables used to translate from Arduino to AVR pin naming
+  volatile uint8_t* port;
+  volatile uint8_t* ddr;
+  volatile uint8_t* pin;
+  // Here we translate the input pin number from
+  //  Arduino pin number to the AVR PORT, PIN, DDR,
+  //  and which bit of those registers we care about.
+  byte bitmask;
+  port = portOutputRegister(digitalPinToPort(pinToMeasure));
+  ddr = portModeRegister(digitalPinToPort(pinToMeasure));
+  bitmask = digitalPinToBitMask(pinToMeasure);
+  pin = portInputRegister(digitalPinToPort(pinToMeasure));
+  // Discharge the pin first by setting it low and output
+  *port &= ~(bitmask);
+  *ddr  |= bitmask;
+  delay(1);
+  uint8_t SREG_old = SREG; //back up the AVR Status Register
+  // Prevent the timer IRQ from disturbing our measurement
+  noInterrupts();
+  // Make the pin an input with the internal pull-up on
+  *ddr &= ~(bitmask);
+  *port |= bitmask;
+
+  // Now see how long the pin to get pulled up. This manual unrolling of the loop
+  // decreases the number of hardware cycles between each read of the pin,
+  // thus increasing sensitivity.
+  uint8_t cycles = 17;
+       if (*pin & bitmask) { cycles =  0;}
+  else if (*pin & bitmask) { cycles =  1;}
+  else if (*pin & bitmask) { cycles =  2;}
+  else if (*pin & bitmask) { cycles =  3;}
+  else if (*pin & bitmask) { cycles =  4;}
+  else if (*pin & bitmask) { cycles =  5;}
+  else if (*pin & bitmask) { cycles =  6;}
+  else if (*pin & bitmask) { cycles =  7;}
+  else if (*pin & bitmask) { cycles =  8;}
+  else if (*pin & bitmask) { cycles =  9;}
+  else if (*pin & bitmask) { cycles = 10;}
+  else if (*pin & bitmask) { cycles = 11;}
+  else if (*pin & bitmask) { cycles = 12;}
+  else if (*pin & bitmask) { cycles = 13;}
+  else if (*pin & bitmask) { cycles = 14;}
+  else if (*pin & bitmask) { cycles = 15;}
+  else if (*pin & bitmask) { cycles = 16;}
+
+  // End of timing-critical section; turn interrupts back on if they were on before, or leave them off if they were off before
+  SREG = SREG_old;
+
+  // Discharge the pin again by setting it low and output
+  //  It's important to leave the pins low if you want to 
+  //  be able to touch more than 1 sensor at a time - if
+  //  the sensor is left pulled high, when you touch
+  //  two sensors, your body will transfer the charge between
+  //  sensors.
+  *port &= ~(bitmask);
+  *ddr  |= bitmask;
+
+  return cycles;
+}
+
+#if defined(BLUETOOTH)
+void getSerial(){
+  uint8_t xmitStatus = 2;
+  bool modValue = 0;
+  bool returnVal = 0;
+  uint8_t readType = Serial.read();
+  if (readType == 'S'){
+    delay(10);
+    uint8_t funct = Serial.read() -'0';
+    uint8_t bit1 = Serial.read() - '0';
+    uint8_t bit2 = Serial.read() - '0';
+    uint8_t valueByte = ((bit1 * 10) + bit2);
+    if (valueByte <= 85){
+      if (Serial.read() == 'E'){
+        if (funct == 1) {
+          if (heatCoolStatus == 0){
+            if (valueByte >= heatSetPointLowerLimit && valueByte <= heatSetPointUpperLimit){
+              heat_set_point = valueByte;
+              modValue = 1;
+            }
+          }
+          else {
+            if (valueByte >= coolSetPointLowerLimit && valueByte <= coolSetPointUpperLimit){
+              cool_set_point = valueByte;
+              modValue = 1;
+            }
+          }
+        }
+        else if (funct == 2) {
+          if (valueByte >= fanRunLengthLowerLimit && valueByte <= fanRunLengthUpperLimit && (valueByte % 15 == 0)){
+              fan_run_length = valueByte;
+              fanCheckMils = millis();
+              displayUpdateMils = millis();
+              returnVal = 1;
+          }
+        }
+        
+      }
+    }
+    if (modValue){
+      tempCheckMils = millis();
+      displayUpdateMils = millis();
+      tempTemp = 1;
+      returnVal = 1;
+    }
+  Serial.print(returnVal);
+  }
+  else if (readType == 'R'){
+    Serial.print(F("T"));
+    Serial.print(d_temperature);
+    if (heatCoolStatus == 0){
+      Serial.print(F("S"));
+      Serial.print(heat_set_point);
+    } 
+    else {
+      Serial.print(F("S"));
+      Serial.print(cool_set_point);
+    }
+    Serial.print(F("M"));
+    Serial.print(heatCoolStatus);
+    Serial.print(F("S"));
+    if (digitalRead (heatRelayPin) || digitalRead (coolRelayPin)) {
+      Serial.print("1");
+    }
+    else {
+      if (heatCoolStatus == 1 && lockOutStat == "lock"){
+        Serial.print("3");
+      }
+      else {
+        Serial.print("0");
+      }
+    }
+  }
+  else if (readType == 'M'){
+     heatCoolStatus = !heatCoolStatus; //switch heat/cool status
+    //read config from EEPROM and set heat/cool set points
+    readConfig();
+    if (whichSched){
+      heat_set_point = morningHeatSetPoint;
+      cool_set_point = morningCoolSetPoint;
+    }
+    else {
+      heat_set_point = eveningHeatSetPoint;
+      cool_set_point = eveningCoolSetPoint;
+    }
+    tempTemp = 0;
+    displayUpdateMils = millis();
+    tempCheckMils = millis();
+    returnVal = 1;
+    Serial.print(returnVal);
+  }
+  else if (readType == 'C'){
+    Serial.print(cycleCount);
+    Serial.write(99);
+    Serial.print(previousCycleCount);
+    Serial.write(99);
+    Serial.print(fan_run_length);
+    Serial.write(99);
+    Serial.print(codeVersion);
+    Serial.write(99);
+    Serial.print(xmitStatus);
+    Serial.write(99);
+    Serial.print(eveningHeatSetPoint);
+    Serial.write(99);
+    Serial.print(eveningCoolSetPoint);
+    Serial.write(99);
+    Serial.print(morningHeatSetPoint);
+    Serial.write(99);
+    Serial.print(morningCoolSetPoint);
+    Serial.write(99);
+    Serial.print(tempOffSet);
+    Serial.write(99);
+    Serial.print(swingTemp);
+    Serial.write(99);
+  }
+  else {
+    Serial.print(returnVal);
+  }
+}
+#endif
